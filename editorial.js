@@ -4,10 +4,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const REFRESH_THRESHOLD = 45.0;   // continuous camera hold limit (seconds)
-const REFRESH_DURATION = 3.0;    // duration of a visual refresh cut (seconds)
+const REFRESH_DURATION = 6.0;    // duration of a visual refresh cut (seconds)
 const REACTION_DURATION = 4.0;    // duration of a listener reaction cut (seconds)
 const REACTION_COOLDOWN = 12.0;   // minimum gap between reaction cuts (seconds)
-const MIN_SHOT_DURATION = 3.0;    // minimum clip before cutting away (seconds)
+const MIN_SHOT_DURATION = 4.0;    // minimum clip before cutting away (seconds)
 const RAPID_TURN_MAX = 5.0;    // max seconds/turn to count as rapid dialogue
 const MERGE_GAP = 1.0;    // gap tolerance for interval merging (seconds)
 //const EDITORIAL_BLOCK = 15.0;   // max segment split size (seconds)
@@ -16,10 +16,10 @@ const MIN_CLIP_DURATION = 2.5;    // minimum clip duration for any cut (seconds)
 const MAX_CLIP_DURATION = 45.0;   // segments longer than this → WIDE
 const MIN_SEG_SECS = 0.5;    // minimum segment duration after trim (seconds)
 const MIN_EMPTY_DURATION = 1.5;    // minimum exclusion interval duration (seconds)
-const INTERRUPTION_DURATION = 3.0;    // interruption detection threshold (seconds)
+const INTERRUPTION_DURATION = 4.0;    // interruption detection threshold (seconds)
 const MAX_MERGED_SHOT_DURATION = 25.0;  // max duration when merging adjacent clips
 const WIDE_BUDGET_RATIO = 0.15;   // WIDE camera target: 15% of total duration
-const HOST_MEDIUM_BUDGET_RATIO = 0.05;  // HOST_MEDIUM cap: 5% of host screen time
+const HOST_MEDIUM_BUDGET_RATIO = 0.25;  // HOST_MEDIUM cap: 25% of host screen time
 const MONOLOGUE_REACTION_THRESHOLD = 12.0; // seconds before reaction becomes eligible
 const PAUSE_THRESHOLD = 2.0;    // gap threshold for pause reset (seconds)
 const DEEP_ENGAGEMENT_THRESHOLD = 30.0; // long monologue threshold (seconds)
@@ -42,7 +42,6 @@ const guestSpeaker = String(calibration.guest_speaker || "");
 const wideCameras = calibration.wide_cameras || [];
 const cameraFaceIntervals = calibration.camera_face_intervals || {};
 const cameraOffsets = calibration.camera_offsets || {};
-
 // Aliases for compatibility
 const camera_inventory = cameraInv;
 const camera_roles = cameraRoles;
@@ -146,17 +145,13 @@ function isSpeakerVisibleInCamera(roleName, speaker, options = {}) {
 
   if (speaker === hostSpeaker) {
     return (
-      roleName === "HOST_CLOSEUP" ||
-      roleName === "HOST_MEDIUM" ||
-      roleName === "WIDE"
+      roleName === "HOST_CLOSEUP" || roleName === "HOST_MEDIUM" || roleName === "WIDE"
     );
   }
 
   if (speaker === guestSpeaker) {
     return (
-      roleName === "GUEST_CLOSEUP" ||
-      roleName === "GUEST_MEDIUM" ||
-      roleName === "WIDE"
+      roleName === "GUEST_CLOSEUP" || roleName === "GUEST_MEDIUM" || roleName === "WIDE"
     );
   }
 
@@ -277,6 +272,48 @@ function getPhysicalEvents(start, end) {
     .filter(e => e.start >= start && e.start < end)
     .sort((a, b) => a.start - b.start);
 }
+
+const wordTimeline = [];
+
+for (const seg of segments) {
+  if (!seg.words) continue;
+  for (const w of seg.words) {
+    wordTimeline.push({
+      word: w.word,
+      start: w.start,
+      end: w.end,
+      speaker: seg.speaker,
+      confidence: w.confidence ?? 1.0,
+      punctuation: /[.,!?;:]$/.test(w.word)
+    });
+  }
+}
+
+const safeCutPoints = [];
+for (let i = 0; i < wordTimeline.length; i++) {
+  const current = wordTimeline[i];
+  const next = wordTimeline[i + 1];
+  const pauseAfter = next ? next.start - current.end : 999;
+  let score = 0;
+  if (/[.!?]$/.test(current.word))
+    score += 100;
+  if (/[,;:]$/.test(current.word))
+    score += 60;
+  if (pauseAfter > 0.30)
+    score += 80;
+  if (pauseAfter > 0.60)
+    score += 100;
+  safeCutPoints.push({
+    time: current.end, score, speaker: current.speaker
+  });
+}
+if (wordTimeline.length === 0) {
+
+  console.warn(
+    "[SAFE CUT] No word timestamps detected."
+  );
+
+}
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 5: EDITORIAL ANALYSIS
 // Produces EditorialBlock objects. No camera decisions here.
@@ -309,9 +346,7 @@ function buildEditorialBlocks(segs) {
       consecutiveSpeakerTime = duration;
     }
 
-    const isInterruption = prevSeg
-      && speaker !== prevSpeaker
-      && (prevSeg.duration || (prevSeg.end - prevSeg.start)) <= INTERRUPTION_DURATION;
+    const isInterruption = prevSeg && speaker !== prevSpeaker && start < prevSeg.end;
 
     // P9: Rapid Dialogue requires 4+ consecutive turns each < 5 seconds
     if (speaker !== prevSpeaker && prevSeg) {
@@ -374,10 +409,57 @@ const hostTotalDuration = segments
 
 const wideBudgetSecs = totalDuration * WIDE_BUDGET_RATIO;
 const hostMediumBudget = hostTotalDuration * HOST_MEDIUM_BUDGET_RATIO;
-
+const protectedWords = new Set([
+  "not",
+  "don't",
+  "never",
+  "must",
+  "because",
+  "however",
+  "important"
+]);
 /**
  * P4: scoring-based camera selection.
  */
+
+function snapToSafeCut(desiredTime, speaker, windowBefore = 1.5, windowAfter = 2.0) {
+  const candidates = safeCutPoints.filter(p => {
+    return (
+      p.speaker == speaker && p.time >= desiredTime - windowBefore && p.time <= desiredTime + windowAfter
+    );
+  });
+  if (!candidates.length) return desiredTime;
+  candidates.sort((a, b) => {
+    const sa = a.score - Math.abs(a.time - desiredTime);
+    const sb = b.score - Math.abs(b.time - desiredTime);
+    return sb - sa;
+  });
+  const word = wordTimeline.find(
+    w => w.end === candidates[0].time
+  );
+
+  if (
+    word &&
+    protectedWords.has(
+      word.word.toLowerCase()
+    )
+  ) {
+
+    return desiredTime;
+
+  }
+  return candidates[0].time;
+}
+
+function avoidMidWordCut(time) {
+  for (const w of wordTimeline) {
+    if (time > w.start && time < w.end) {
+      return w.end;
+    }
+  }
+  return time;
+}
+
 function scoreCandidates(speaker, state, start, end, options = {}) {
   const candidates = [];
 
@@ -453,7 +535,32 @@ function scoreCandidates(speaker, state, start, end, options = {}) {
       roleName: r.name
     });
   }
+  if (
+    state.lastSpecialCut &&
+    !options.isReaction &&
+    !options.isRefresh
+  ) {
 
+    if (speaker === hostSpeaker) {
+
+      if (r.name === "HOST_CLOSEUP")
+        score += 200;
+
+      if (r.name === "HOST_MEDIUM")
+        score += 120;
+
+    }
+    else {
+
+      if (r.name === "GUEST_CLOSEUP")
+        score += 200;
+
+      if (r.name === "GUEST_MEDIUM")
+        score += 120;
+
+    }
+    state.lastSpecialCut = null;
+  }
   // Sort descending by score
   candidates.sort((a, b) => b.score - a.score);
   return candidates[0] || null;
@@ -469,15 +576,15 @@ function selectRefreshCamera(speaker, state, block) {
   // Fixed lists of role names in priority order
   const priorities = (speaker === hostSpeaker)
     ? [
-      "HOST_MEDIUM",
       "GUEST_CLOSEUP",
       "WIDE",
+      "HOST_MEDIUM",
       "HOST_CLOSEUP"
     ]
     : [
-      "GUEST_MEDIUM",
       "HOST_CLOSEUP",
       "WIDE",
+      "GUEST_MEDIUM",
       "GUEST_CLOSEUP"
     ];
 
@@ -487,7 +594,23 @@ function selectRefreshCamera(speaker, state, block) {
     if (!camId) continue;
 
     // Filter out current camera (P3)
-    if (camId === state.currentCamera) continue;
+    if (speaker === hostSpeaker) {
+
+      if (
+        roleName === "HOST_CLOSEUP" ||
+        roleName === "HOST_MEDIUM"
+      )
+        continue;
+
+    } else {
+
+      if (
+        roleName === "GUEST_CLOSEUP" ||
+        roleName === "GUEST_MEDIUM"
+      )
+        continue;
+
+    }
 
     // Check availability
     if (!isCameraAvailableAtTime(camId, block.start, block.end)) continue;
@@ -556,6 +679,7 @@ const cameraState = {
   wideBudgetRemaining: wideBudgetSecs,
   hostMediumBudgetRemaining: hostMediumBudget,
   timelineCursor: 0,
+  lastSpecialCut: null,
   recentCameras: [] // P13 variety tracker (last 5 cameras)
 };
 
@@ -590,6 +714,7 @@ function refreshShot(state, camera, speaker, time) {
   state.lastSpeaker = speaker;
   state.timelineCursor = time;
   state.lastRefreshTime = time;
+  state.lastSpecialCut = "refresh";
 
   state.recentCameras.push(camera);
   if (state.recentCameras.length > 5) {
@@ -604,6 +729,7 @@ function reactionShot(state, camera, speaker, time) {
   state.currentShotStartedAt = time;
   state.timelineCursor = time;
   state.lastReactionTime = time;
+  state.lastSpecialCut = "reaction";
 
   state.recentCameras.push(camera);
   if (state.recentCameras.length > 5) {
@@ -627,6 +753,8 @@ const finalClips = [];
  */
 function emitSubClip(state, cam, start, end, shotType, reason, speaker, mode) {
   const duration = end - start;
+  if (!cam)
+    return;
   if (duration <= 0) return;
 
   // Call state machine ops
@@ -754,10 +882,26 @@ function applyCinematicRules(state, block, baseSelection) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function pushClip(cam, seg, shotType, reason, overrideDur) {
+  if (!cam)
+    return;
+
+  if (seg.end <= seg.start)
+    return;
   const offset = cameraOffsets[cam] || 0;
 
   let source_start = seg.start + offset;
   let source_end = seg.end + offset;
+  source_start =
+    Math.max(
+      0,
+      seg.start + offset
+    );
+
+  source_end =
+    Math.max(
+      source_start,
+      seg.end + offset
+    );
 
   const dur = overrideDur !== undefined ? overrideDur : (source_end - source_start);
   const frames = Math.round(dur * FPS);
@@ -809,7 +953,11 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
   // If a reaction is eligible, calculate the insertion split offset
   let reactionInsertOffset = -1;
   if (reactionInfo && remaining > MIN_SHOT_DURATION + REACTION_DURATION + MIN_SHOT_DURATION) {
-    reactionInsertOffset = findReactionSplitTime(block);
+    reactionInsertOffset = block.start + findReactionSplitTime(block);
+
+    reactionInsertOffset = snapToSafeCut(reactionInsertOffset, block.speaker);
+    reactionInsertOffset = avoidMidWordCut(reactionInsertOffset);
+    reactionInsertOffset -= block.start;
   }
 
   while (remaining > 0) {
@@ -827,34 +975,41 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
 
       if (offset >= MIN_SHOT_DURATION && offset < remaining) {
 
+        let safeEventStart =
+          snapToSafeCut(
+            evt.start,
+            block.speaker
+          );
+
+        safeEventStart =
+          avoidMidWordCut(
+            safeEventStart
+          );
+
         emitSubClip(
           cameraState,
           primarySelection.camera,
           cursor,
-          evt.start,
+          safeEventStart,
           primarySelection.shotType,
           primarySelection.reason,
           block.speaker,
           "normal"
         );
 
-        cursor = evt.start;
+        cursor = safeEventStart;
         remaining = blockEnd - cursor;
 
         let cutCam = null;
 
         if (evt.editorial_action === "CUT_TO_LISTENER") {
 
-          const listener =
-            block.speaker === hostSpeaker
-              ? cameraByRole["GUEST_CLOSEUP"]
-              : cameraByRole["HOST_CLOSEUP"];
-
+          const listener = block.speaker === hostSpeaker ? cameraByRole["GUEST_CLOSEUP"] : cameraByRole["HOST_CLOSEUP"];
           cutCam = listener;
 
         } else {
 
-          cutCam = cameraByRole["WIDE"];
+          cutCam = cameraByRole["WIDE"] || primarySelection.camera;
 
         }
 
@@ -876,9 +1031,23 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
         );
 
         cursor = cutEnd;
+        cursor = avoidMidWordCut(cursor);
         remaining = blockEnd - cursor;
 
         physicalIndex++;
+        primarySelection = {
+          camera:
+            block.speaker === hostSpeaker
+              ? cameraByRole["HOST_CLOSEUP"] || cameraByRole["HOST_MEDIUM"]
+              : cameraByRole["GUEST_CLOSEUP"] || cameraByRole["GUEST_MEDIUM"],
+
+          shotType:
+            block.speaker === hostSpeaker
+              ? "host-closeup"
+              : "guest-closeup",
+
+          reason: "return-to-speaker"
+        };
 
         const reselect = scoreCandidates(
           block.speaker,
@@ -889,26 +1058,32 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
 
         if (reselect)
           primarySelection =
-            applyCinematicRules(
-              cameraState,
-              block,
-              reselect
-            );
+            applyCinematicRules(cameraState, block, reselect);
+
         // Recalculate reaction timing after physical cut
-        if (
-          reactionInfo &&
-          remaining >
-          MIN_SHOT_DURATION +
-          REACTION_DURATION +
-          MIN_SHOT_DURATION
-        ) {
+        if (reactionInfo && remaining > MIN_SHOT_DURATION + REACTION_DURATION + MIN_SHOT_DURATION) {
           reactionInsertOffset =
+            cursor +
             findReactionSplitTime({
               ...block,
               start: cursor,
               duration: remaining
             });
-        } else {
+
+          reactionInsertOffset =
+            snapToSafeCut(
+              reactionInsertOffset,
+              block.speaker
+            );
+
+          reactionInsertOffset =
+            avoidMidWordCut(
+              reactionInsertOffset
+            );
+
+          reactionInsertOffset -= cursor;
+        }
+        else {
           reactionInsertOffset = -1;
         }
         continue;
@@ -949,7 +1124,30 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
 
     // Split at exactly the hold limit
     if (capacity > 0) {
-      emitSubClip(cameraState, primarySelection.camera, cursor, cursor + capacity, primarySelection.shotType, primarySelection.reason, block.speaker, "normal");
+
+      let refreshSplit = cursor + capacity;
+
+      refreshSplit = snapToSafeCut(
+        refreshSplit, block.speaker
+      );
+
+      refreshSplit = avoidMidWordCut(
+        refreshSplit
+      );
+
+      capacity = refreshSplit - cursor;
+
+      emitSubClip(
+        cameraState,
+        primarySelection.camera,
+        cursor,
+        cursor + capacity,
+        primarySelection.shotType,
+        primarySelection.reason,
+        block.speaker,
+        "normal"
+      );
+
       cursor += capacity;
       remaining -= capacity;
     }
