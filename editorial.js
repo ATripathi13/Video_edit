@@ -18,7 +18,7 @@ const MIN_SEG_SECS = 0.5;    // minimum segment duration after trim (seconds)
 const MIN_EMPTY_DURATION = 1.5;    // minimum exclusion interval duration (seconds)
 const INTERRUPTION_DURATION = 4.0;    // interruption detection threshold (seconds)
 const MAX_MERGED_SHOT_DURATION = 25.0;  // max duration when merging adjacent clips
-const WIDE_BUDGET_RATIO = 0.15;   // WIDE camera target: 15% of total duration
+const WIDE_BUDGET_RATIO = 0.25;   // WIDE camera target: 15% of total duration
 const HOST_MEDIUM_BUDGET_RATIO = 0.25;  // HOST_MEDIUM cap: 25% of host screen time
 const MONOLOGUE_REACTION_THRESHOLD = 12.0; // seconds before reaction becomes eligible
 const PAUSE_THRESHOLD = 2.0;    // gap threshold for pause reset (seconds)
@@ -392,7 +392,7 @@ function buildEditorialBlocks(segs) {
 
   return blocks;
 }
-
+// segments = mergeSpeakerSegments(segments);
 const editorialBlocks = buildEditorialBlocks(segments);
 console.log('[EDITORIAL] Built ' + editorialBlocks.length + ' editorial blocks.');
 
@@ -526,6 +526,32 @@ function scoreCandidates(speaker, state, start, end, options = {}) {
       const occurrences = state.recentCameras.filter(c => c === camId).length;
       score -= (occurrences * 10);
     }
+    if (
+      state.lastSpecialCut &&
+      !options.isReaction &&
+      !options.isRefresh
+    ) {
+
+      if (speaker === hostSpeaker) {
+
+        if (r.name === "HOST_CLOSEUP")
+          score += 200;
+
+        if (r.name === "HOST_MEDIUM")
+          score += 120;
+
+      }
+      else {
+
+        if (r.name === "GUEST_CLOSEUP")
+          score += 200;
+
+        if (r.name === "GUEST_MEDIUM")
+          score += 120;
+
+      }
+      // state.lastSpecialCut = null;
+    }
 
     candidates.push({
       camera: camId,
@@ -535,35 +561,16 @@ function scoreCandidates(speaker, state, start, end, options = {}) {
       roleName: r.name
     });
   }
-  if (
-    state.lastSpecialCut &&
-    !options.isReaction &&
-    !options.isRefresh
-  ) {
 
-    if (speaker === hostSpeaker) {
-
-      if (r.name === "HOST_CLOSEUP")
-        score += 200;
-
-      if (r.name === "HOST_MEDIUM")
-        score += 120;
-
-    }
-    else {
-
-      if (r.name === "GUEST_CLOSEUP")
-        score += 200;
-
-      if (r.name === "GUEST_MEDIUM")
-        score += 120;
-
-    }
-    state.lastSpecialCut = null;
-  }
   // Sort descending by score
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0] || null;
+
+  const winner = candidates[0] || null;
+
+  if (winner)
+    state.lastSpecialCut = null;
+
+  return winner;
 }
 
 /**
@@ -660,6 +667,47 @@ function selectReactionCamera(speaker, state, block) {
   }
   return null;
 }
+// ------------------------------------------------------------------
+// Select which camera should be used when returning to the speaker
+// after a reaction / refresh / physical adjustment.
+// ------------------------------------------------------------------
+function getSpeakerReturnSelection(speaker, state, block) {
+
+  const longHold = block.isLongMonologue || block.duration >= 20;
+
+  if (speaker === hostSpeaker) {
+
+    const role = longHold
+      ? "HOST_MEDIUM"
+      : "HOST_CLOSEUP";
+
+    return {
+      camera:
+        cameraByRole[role] ||
+        cameraByRole["HOST_CLOSEUP"],
+      shotType:
+        role === "HOST_MEDIUM"
+          ? "host-medium"
+          : "host-closeup",
+      reason: "return-to-speaker"
+    };
+  }
+
+  const role = longHold
+    ? "GUEST_MEDIUM"
+    : "GUEST_CLOSEUP";
+
+  return {
+    camera:
+      cameraByRole[role] ||
+      cameraByRole["GUEST_CLOSEUP"],
+    shotType:
+      role === "GUEST_MEDIUM"
+        ? "guest-medium"
+        : "guest-closeup",
+    reason: "return-to-speaker"
+  };
+}
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -751,6 +799,26 @@ const finalClips = [];
 /**
  * P2: The single unified entry point for pushing and transitioning.
  */
+function getSpeechRelativeRange(
+  block,
+  cursor,
+  duration
+) {
+
+  return {
+
+    start:
+      cursor,
+
+    end:
+      Math.min(
+        cursor + duration,
+        block.end
+      )
+
+  };
+
+}
 function emitSubClip(state, cam, start, end, shotType, reason, speaker, mode) {
   const duration = end - start;
   if (!cam)
@@ -837,7 +905,7 @@ function applyCinematicRules(state, block, baseSelection) {
   }
 
   // During rapid back-and-forth, prefer WIDE to avoid whiplash cutting
-  if (block.isRapidDialogue) {
+  if (block.isRapidDialogue && block.duration >= 8 && state.wideBudgetRemaining > block.duration) {
     const w = cameraByRole["WIDE"];
     if (w && state.wideBudgetRemaining > block.duration) {
       selection = { camera: w, shotType: "wide", reason: "rapid-dialogue-wide" };
@@ -889,15 +957,13 @@ function pushClip(cam, seg, shotType, reason, overrideDur) {
     return;
   const offset = cameraOffsets[cam] || 0;
 
-  let source_start = seg.start + offset;
-  let source_end = seg.end + offset;
-  source_start =
+  const source_start =
     Math.max(
       0,
       seg.start + offset
     );
 
-  source_end =
+  const source_end =
     Math.max(
       source_start,
       seg.end + offset
@@ -942,8 +1008,9 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
   // Determine if a reaction cut should insert
   let reactionInfo = null;
   const timeSinceLastReaction = block.start - cameraState.lastReactionTime;
+  const nearRefresh = cameraState.currentHold >= REFRESH_THRESHOLD - 5;
 
-  if (block.reactionEligible && timeSinceLastReaction >= REACTION_COOLDOWN && !block.isRapidDialogue) {
+  if (block.reactionEligible && timeSinceLastReaction >= REACTION_COOLDOWN && !block.isRapidDialogue && !nearRefresh) {
     reactionInfo = selectReactionCamera(block.speaker, cameraState, block);
   }
 
@@ -1016,7 +1083,7 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
         const cutDuration = Math.min(3.0, evt.end - evt.start);
 
         const cutEnd = Math.min(cursor + cutDuration, blockEnd);
-
+        const speechResume = cutEnd;
         emitSubClip(
           cameraState,
           cutCam,
@@ -1030,35 +1097,15 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
           "reaction"
         );
 
-        cursor = cutEnd;
-        cursor = avoidMidWordCut(cursor);
+        cursor = avoidMidWordCut(speechResume);
         remaining = blockEnd - cursor;
 
         physicalIndex++;
-        primarySelection = {
-          camera:
-            block.speaker === hostSpeaker
-              ? cameraByRole["HOST_CLOSEUP"] || cameraByRole["HOST_MEDIUM"]
-              : cameraByRole["GUEST_CLOSEUP"] || cameraByRole["GUEST_MEDIUM"],
+        cameraState.currentHold = 0;
 
-          shotType:
-            block.speaker === hostSpeaker
-              ? "host-closeup"
-              : "guest-closeup",
+        primarySelection = getSpeakerReturnSelection(block.speaker, cameraState, block);
 
-          reason: "return-to-speaker"
-        };
-
-        const reselect = scoreCandidates(
-          block.speaker,
-          cameraState,
-          cursor,
-          blockEnd
-        );
-
-        if (reselect)
-          primarySelection =
-            applyCinematicRules(cameraState, block, reselect);
+        beginShot(cameraState, primarySelection.camera, block.speaker, cutEnd);
 
         // Recalculate reaction timing after physical cut
         if (reactionInfo && remaining > MIN_SHOT_DURATION + REACTION_DURATION + MIN_SHOT_DURATION) {
@@ -1102,16 +1149,23 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
         remaining -= splitTime;
 
         // Step B: Emit listener reaction cut (INTERRUPT)
-        const reactDur = Math.min(REACTION_DURATION, remaining);
+        const reactDur = Math.min(remaining, Math.max(2.5, Math.min(REACTION_DURATION, block.duration * 0.08)));
+
         emitSubClip(cameraState, reactionInfo.camera, cursor, cursor + reactDur, reactionInfo.shotType, "reaction-listener-nod", block.speaker, "reaction");
         cursor += reactDur;
         remaining -= reactDur;
 
         // Reselect primary selection for remaining speaker duration (hold was reset by reaction cut)
-        const reselect = scoreCandidates(block.speaker, cameraState, cursor, blockEnd);
-        if (reselect) {
-          primarySelection = applyCinematicRules(cameraState, block, reselect);
-        }
+        // const reselect = scoreCandidates(block.speaker, cameraState, cursor, blockEnd);
+        // if (reselect) {
+        //   primarySelection = applyCinematicRules(cameraState, block, reselect);
+        // }
+        // continue;
+        // Force return to active speaker after reaction
+        primarySelection = getSpeakerReturnSelection(block.speaker, cameraState, block);
+
+        // Reset the hold timer for the new speaker shot
+        beginShot(cameraState, primarySelection.camera, block.speaker, cursor);
         continue;
       }
     }
@@ -1131,11 +1185,9 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
         refreshSplit, block.speaker
       );
 
-      refreshSplit = avoidMidWordCut(
-        refreshSplit
-      );
+      refreshSplit = avoidMidWordCut(refreshSplit);
 
-      capacity = refreshSplit - cursor;
+      capacity = Math.min(remaining, Math.max(MIN_SHOT_DURATION, refreshSplit - cursor));
 
       emitSubClip(
         cameraState,
@@ -1155,18 +1207,31 @@ for (let bi = 0; bi < editorialBlocks.length; bi++) {
     // Insert mandatory refresh
     const refreshDur = Math.min(REFRESH_DURATION, remaining, blockEnd - cursor);
     const refreshBlock = { speaker: block.speaker, start: cursor, end: cursor + refreshDur, duration: refreshDur, isPause: block.isPause, isInterruption: block.isInterruption, isRapidDialogue: block.isRapidDialogue, isLongMonologue: block.isLongMonologue };
+    cameraState.timelineCursor = cursor;
     const refreshSelection = selectRefreshCamera(block.speaker, cameraState, refreshBlock);
 
     if (refreshSelection) {
-      emitSubClip(cameraState, refreshSelection.camera, cursor, cursor + refreshDur, refreshSelection.shotType, "maximum-camera-hold", block.speaker, "refresh");
-      cursor += refreshDur;
-      remaining -= refreshDur;
+      const refreshRange = getSpeechRelativeRange(block, cursor, refreshDur);
+      emitSubClip(cameraState, refreshSelection.camera, refreshRange.start, refreshRange.end, refreshSelection.shotType, "maximum-camera-hold", block.speaker, "refresh");
+      // Camera changed.
+      // Speech has NOT advanced.
+      cursor = refreshRange.end;
+      remaining = blockEnd - cursor;
+      cameraState.currentHold = 0;
 
-      // Reselect primary selection for remaining speaker duration (hold is reset to 0 by refresh)
-      const reselect = scoreCandidates(block.speaker, cameraState, cursor, blockEnd);
-      if (reselect) {
-        primarySelection = applyCinematicRules(cameraState, block, reselect);
-      }
+      primarySelection =
+        getSpeakerReturnSelection(
+          block.speaker,
+          cameraState,
+          block
+        );
+
+      beginShot(
+        cameraState,
+        primarySelection.camera,
+        block.speaker,
+        cursor
+      );
     } else {
       // Fallback: just emit remaining duration if no refresh camera is possible
       emitSubClip(cameraState, primarySelection.camera, cursor, cursor + remaining, primarySelection.shotType, primarySelection.reason, block.speaker, "normal");
@@ -1305,7 +1370,46 @@ console.log(
   processedClips.length
 );
 
-// return [{ json: { clips: finalClips.filter(c => c.duration_frames > 0) } }];
+function validateSpeechCoverage() {
+
+  const spoken = [];
+
+  for (const seg of segments) {
+
+    if (!seg.words) continue;
+
+    for (const w of seg.words) {
+
+      spoken.push(w);
+
+    }
+
+  }
+
+  for (const word of spoken) {
+
+    const covered =
+      processedClips.some(c =>
+        c.source_start <= word.start &&
+        c.source_end >= word.end
+      );
+
+    if (!covered) {
+
+      console.warn(
+        "[WORD LOST]",
+        word.word,
+        word.start,
+        word.end
+      );
+
+    }
+
+  }
+
+}
+
+validateSpeechCoverage();
 return [{
   json: {
     clips: processedClips.filter(
